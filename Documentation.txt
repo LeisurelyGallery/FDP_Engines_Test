@@ -1,0 +1,343 @@
+The retry failed because the patch contained formatting errors. You can manually create `FDP_SETUP_GUIDE.md` with this content:
+
+```markdown
+# FDP Engines Setup Guide
+
+This repository is a streaming ETL stack using SQL Server, Kafka, Apache Flink, and ClickHouse.
+
+## Folder map
+
+- `Docker-compose.yml`: Kafka, Kafka UI, ClickHouse, and Flink services.
+- `clickhouse/init/`: ClickHouse tables and Kafka materialized views.
+- `flink/Dockerfile`: Flink plus Kafka, JDBC, SQL Server, and CDC connectors.
+- `flink/sql/`: Flink SQL jobs.
+- `flink/sql/generated/`: generated CDC jobs containing credentials; do not commit.
+- `kafka/topics.txt`: topics created by `kafka-init`.
+- `mssql/init/`: SQL Server schema, login, and CDC scripts.
+- `mssql/tools/`: live schema inspection and CDC SQL generation.
+- `Producer/`: CSV files and Python Kafka producers.
+
+## Architecture
+
+```text
+SQL Server CDC ──> Flink SQL ──> Kafka ──> ClickHouse
+CSV producers ───> Kafka ──────> Flink SQL ──> ClickHouse or SQL Server
+```
+
+Kafka is `kafka:19092` inside Docker and `localhost:39092` from the host.
+
+- Kafka UI: http://localhost:8181
+- Flink UI: http://localhost:8081
+- ClickHouse HTTP: http://localhost:8124
+- SQL Server: `192.168.1.83:1433`
+
+## Prerequisites
+
+- Docker Desktop with Compose
+- Python 3
+- SSMS or another SQL Server client
+- SQL Server Agent running
+- A source table with a primary key or unique index
+
+Check SQL Server access:
+
+```powershell
+Test-NetConnection 192.168.1.83 -Port 1433
+```
+
+## Start the platform
+
+From the repository root:
+
+```powershell
+docker compose up -d --build
+docker compose ps
+```
+
+Topics come from `kafka/topics.txt`. After adding a topic:
+
+```powershell
+docker compose up -d --force-recreate kafka-init
+```
+
+ClickHouse initialization scripts run only on a new data volume. Apply a script to an existing volume with:
+
+```powershell
+Get-Content -Raw clickhouse/init/004_oltp55_schema_container.sql |
+  docker exec -i fdp-engine-clickhouse clickhouse-client --multiquery
+```
+
+## Flink connectors
+
+The custom image installs:
+
+- Kafka SQL connector
+- Flink JDBC connector
+- ClickHouse JDBC driver
+- Microsoft SQL Server JDBC driver
+- SQL Server CDC connector
+
+Rebuild after Dockerfile changes:
+
+```powershell
+docker compose build --no-cache flink-jobmanager flink-taskmanager
+docker compose up -d
+```
+
+Verify the CDC connector:
+
+```powershell
+docker exec fdp-engine-flink-jobmanager ls /opt/flink/lib/*sqlserver-cdc*
+```
+
+The command must show the CDC JAR. Otherwise jobs using `sqlserver-cdc` cannot start.
+
+## Enable SQL Server CDC
+
+Run `mssql/init/003_enable_cdc.sql` in SSMS as a privileged account.
+
+Before running it:
+
+1. Replace `<Flink_Cdc_Password>` with a strong password.
+2. Confirm the database is `OLTPSemi_55`.
+3. Confirm the table is `OLTP55_Schema.Container`.
+4. Ensure SQL Server Agent is running.
+5. Ensure the source table has a primary key.
+
+Verify CDC:
+
+```sql
+SELECT is_cdc_enabled
+FROM sys.databases
+WHERE name = N'OLTPSemi_55';
+
+USE OLTPSemi_55;
+
+SELECT capture_instance
+FROM cdc.change_tables
+WHERE source_object_id = OBJECT_ID(N'OLTP55_Schema.Container');
+```
+
+The first query must return `1`. The second must return a capture instance.
+
+## Generate a CDC Flink job
+
+Set credentials in PowerShell:
+
+```powershell
+$env:MSSQL_USER = 'flink_cdc'
+$env:MSSQL_PASSWORD = 'replace-with-your-password'
+```
+
+Generate the default `Container` job:
+
+```powershell
+python mssql/tools/introspect_container.py --write --mode cdc
+```
+
+The generator reads the live schema and writes:
+
+- A generated Flink CDC SQL job
+- A ClickHouse DDL file
+
+Generated SQL contains the SQL Server password and must not be committed.
+
+For another table:
+
+```powershell
+python mssql/tools/introspect_container.py `
+  --database OLTPSemi_55 `
+  --schema OLTP55_Schema `
+  --table WorkflowStep `
+  --write --mode cdc
+```
+
+Use `--mode batch` for a one-time JDBC read without CDC.
+
+## Prepare Kafka and ClickHouse
+
+Add the generated topic to `kafka/topics.txt`.
+
+For `OLTP55_Schema.WorkflowStep`, the topic is:
+
+```text
+oltp55_schema_workflowstep
+```
+
+Create the topic:
+
+```powershell
+docker compose up -d --force-recreate kafka-init
+```
+
+Apply the generated ClickHouse DDL before submitting Flink:
+
+```powershell
+Get-Content -Raw clickhouse/init/002_oltp55_schema_workflowstep.sql |
+  docker exec -i fdp-engine-clickhouse clickhouse-client --multiquery
+```
+
+## Submit a CDC Flink job
+
+Use one line in PowerShell. A trailing backslash is not PowerShell continuation syntax.
+
+```powershell
+docker exec -it fdp-engine-flink-jobmanager /opt/flink/bin/sql-client.sh -f /opt/flink/usrlib/sql/generated/oltp55_schema_workflowstep_cdc.sql
+```
+
+Monitor the job:
+
+```powershell
+Invoke-RestMethod http://localhost:8081/jobs/overview
+```
+
+Check ClickHouse:
+
+```powershell
+docker exec fdp-engine-clickhouse clickhouse-client --query "SELECT count() FROM fdp.oltp55_schema_workflowstep"
+```
+
+For `ReplacingMergeTree` targets, use `FINAL` when checking deduplicated results:
+
+```sql
+SELECT count()
+FROM fdp.oltp55_schema_workflowstep FINAL;
+```
+
+The current materialized views filter delete events. Updates are represented as newer rows and may require `FINAL` or table optimization.
+
+## CSV consolidation job
+
+`flink/sql/consolidate_users.sql` reads Kafka topics `users` and `Test`, joins records on `id`, and writes to `consolidated_users`.
+
+Submit the job:
+
+```powershell
+docker exec -it fdp-engine-flink-jobmanager /opt/flink/bin/sql-client.sh -f /opt/flink/usrlib/sql/consolidate_users.sql
+```
+
+Publish sample records:
+
+```powershell
+python Producer/publish_csv_topics.py --limit 1000
+```
+
+Check the result:
+
+```powershell
+docker exec fdp-engine-clickhouse clickhouse-client --query "SELECT count() FROM fdp.consolidated_users"
+```
+
+## SQL Server JDBC sink
+
+Run this script in SSMS first:
+
+```text
+mssql/init/001_consolidated_users.sql
+```
+
+Set the SQL Server credentials in:
+
+```text
+flink/sql/consolidate_users_mssql.sql
+```
+
+Submit the job:
+
+```powershell
+docker exec -it fdp-engine-flink-jobmanager /opt/flink/bin/sql-client.sh -f /opt/flink/usrlib/sql/consolidate_users_mssql.sql
+```
+
+The sink is append-oriented and at-least-once. Duplicate rows after a restart are possible.
+
+## Troubleshooting
+
+| Problem | Action |
+|---|---|
+| No factory for `sqlserver-cdc` | Rebuild the Flink image and verify the CDC JAR |
+| Login failed | Check SQL Server credentials and roles |
+| No capture instance | Rerun CDC setup and query `cdc.change_tables` |
+| Login timeout | Check firewall, VPN, and SQL Server connectivity |
+| Kafka topic missing | Add it to `kafka/topics.txt` and recreate `kafka-init` |
+| ClickHouse table missing | Apply the generated DDL manually |
+| No Flink slots | Check the Flink UI and TaskManager |
+
+Useful diagnostics:
+
+```powershell
+docker compose ps
+docker logs --tail 200 fdp-engine-flink-jobmanager
+docker logs --tail 200 fdp-engine-flink-taskmanager
+docker exec fdp-engine-kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:19092 --list
+```
+
+## Security
+
+- Rotate credentials that have been shared or committed.
+- Prefer `flink_cdc` and `flink_sink` accounts instead of `sa`.
+- Never commit `flink/sql/generated/*.sql`.
+- Replace the default ClickHouse password.
+- Avoid hardcoding production credentials in Flink SQL files.
+```
+
+
+You’re right—the guide omitted `mssql/run_pipeline.ps1`.
+
+Add this section:
+
+```markdown
+## Automated pipeline runner
+
+`mssql/run_pipeline.ps1` automates the SQL Server CDC → Kafka → ClickHouse workflow.
+
+It can:
+
+- Add the Kafka topic to `kafka/topics.txt`
+- Recreate `kafka-init`
+- Apply the matching ClickHouse DDL
+- Submit the Flink SQL job
+- Display Flink job status
+- Display the ClickHouse row count
+
+Example:
+
+```powershell
+.\mssql\run_pipeline.ps1 `
+  -Slug oltp55_schema_workflowstep `
+  -CreateTopic `
+  -ApplyDdl `
+  -Submit `
+  -JobFile generated\oltp55_schema_workflowstep_cdc.sql
+```
+
+Parameters:
+
+- `-Slug` — required target name, usually `<schema>_<table>`.
+- `-Topic` — optional Kafka topic; defaults to `Slug`.
+- `-CreateTopic` — adds the topic and recreates `kafka-init`.
+- `-ApplyDdl` — applies the matching `clickhouse/init/*_<slug>.sql` file.
+- `-Submit` — submits the Flink SQL job.
+- `-JobFile` — Flink SQL file relative to `flink/sql`.
+
+Important: generated CDC jobs are stored under `flink/sql/generated/`, so specify:
+
+```powershell
+-JobFile generated\oltp55_schema_workflowstep_cdc.sql
+```
+
+The script modifies `kafka/topics.txt` when `-CreateTopic` is used.
+
+It also expects the ClickHouse table to be named:
+
+```text
+fdp.<slug>
+```
+
+For example:
+
+```text
+fdp.oltp55_schema_workflowstep
+```
+
+The script always checks Flink job status and ClickHouse row counts at the end, even if none of the optional switches are supplied.
+```
