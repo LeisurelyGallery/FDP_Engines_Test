@@ -1,0 +1,6 @@
+flink/sql/generated/*.sql
+.env
+*.local
+__pycache__/
+*.py[cod]
+**/.pytest_cache/

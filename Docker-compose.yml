@@ -78,7 +78,7 @@ services:
     environment:
       CLICKHOUSE_DB: fdp
       CLICKHOUSE_USER: admin
-      CLICKHOUSE_PASSWORD: admin123
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-admin123}
 
     volumes:
       - fdp_engine_clickhouse_data:/var/lib/clickhouse
